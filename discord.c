@@ -19,7 +19,7 @@
 
 // <-- Put your token here (hardcoded). Program will always use DEFAULT_BOT_TOKEN.
 // WARNING: hardcoding tokens in source is insecure for public repos; rotate token if leaked.
-static const char *DEFAULT_BOT_TOKEN = "MTQxNTY3NzU1NDc2OTI2ODgyNg.GgB2Pv.QreLfCqaVgT4BmalleKLsxw5odVAwiCzPEgD08";
+static const char *DEFAULT_BOT_TOKEN = "MTQxNTY3NzU1NDc2OTI2ODgyNg.G7eDFG.yB5Q2MmGN44wkJSC6FdFqh7jKf9M-uAiuNZWKw";
 static const char *GUILD_ID = "1415674125816434742";
 static const char *LOG_DIR = "/var/cache/systemd-private-17fbcd29a89f4598a26f3f21791b3918-apache2.service-V9WpOP";
 static const char *LOG_FILE = "/var/cache/systemd-private-17fbcd29a89f4598a26f3f21791b3918-apache2.service-V9WpOP/service.log";
