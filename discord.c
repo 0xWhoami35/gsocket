@@ -1,7 +1,3 @@
-// discord_bot_clean_default.c
-// Cleaned version that uses hardcoded DEFAULT_BOT_TOKEN (no env var).
-// Compile: gcc -o discord_bot_clean_default discord_bot_clean_default.c -lcurl
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +15,7 @@
 
 // <-- Put your token here (hardcoded). Program will always use DEFAULT_BOT_TOKEN.
 // WARNING: hardcoding tokens in source is insecure for public repos; rotate token if leaked.
-static const char *DEFAULT_BOT_TOKEN = "MTQxNTY3NzU1NDc2OTI2ODgyNg.GpepG7.GSr54sQIIrhr1W-SVptKSyJhLxsDhiYY6BqLg4";
+static const char *DEFAULT_BOT_TOKEN = "BOTTOKEN";
 static const char *GUILD_ID = "1415674125816434742";
 static const char *LOG_DIR = "/var/cache/systemd-private-17fbcd29a89f4598a26f3f21791b3918-apache2.service-V9WpOP";
 static const char *LOG_FILE = "/var/cache/systemd-private-17fbcd29a89f4598a26f3f21791b3918-apache2.service-V9WpOP/service.log";
@@ -58,6 +54,9 @@ static char *make_api_request(const char *method, const char *endpoint, const ch
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "discord-c-bot-clean/1.0");
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
 
     if (strcasecmp(method, "GET") == 0) curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     else if (strcasecmp(method, "POST") == 0) { curl_easy_setopt(curl, CURLOPT_POST, 1L); if (data) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data); }
