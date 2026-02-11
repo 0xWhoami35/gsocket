@@ -538,6 +538,7 @@ _ts_add_pdir() {
 
 	pdir="$(dirname "${1:?}")"
 	ts_is_marked "$pdir" && return 200
+
 	_ts_add "$pdir" "<NOT BY ADD_PDIR>"
 }
 
@@ -1798,8 +1799,6 @@ After=network.target
 
 [Service]
 Type=oneshot
-Restart=always
-RestartSec=0
 RemainAfterExit=${remain}
 ExecStart=${DSTBIN}
 
